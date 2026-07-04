@@ -46,21 +46,25 @@ Routes are thin, services are fat — every rule lives in `services/`. Service f
 
 **Reproduced it:** ran the existing test suite. `tests/test_streaks.py::test_streak_increments_on_sunday` failed. The test sets up a listen on Saturday, June 15 2024 (streak → 1), then a listen the next day, Sunday June 16. Expected streak of 2, got 1.
 
-**Root cause:** `update_listening_streak()` in `streak_service.py` increments the streak with `elif days_since_last == 1 and today.weekday() != 6:`. The `weekday() != 6` clause has no reason to be there — it forces a reset to 1 any time the current listen falls on a Sunday, even when the previous listen was exactly one day earlier.
+**How I found the root cause:** the failing test pointed straight at `update_listening_streak()` in `streak_service.py`. Read the function top to bottom and found the increment branch had a second condition tacked onto it beyond the day-gap check.
 
-**Fix:** [describe your one-line change and commit hash once made]
+**Root cause:** `update_listening_streak()` increments the streak with `elif days_since_last == 1 and today.weekday() != 6:`. The `weekday() != 6` clause forces a reset to 1 any time the current listen falls on a Sunday, even when the previous listen was exactly one day earlier. Nothing else in the function references weekday, and the docstring's streak rules don't mention any day-of-week exception, so this clause had no reason to exist.
 
-**Verification:** [pytest output after fix]
+**Fix:** removed `and today.weekday() != 6`, leaving `elif days_since_last == 1:`. Commit `b807f66`.
+
+**Verification:** full `test_streaks.py` suite passes, 5/5, including `test_streak_resets_after_skipped_day`, confirming the reset-on-gap behavior on the other side of the boundary still works.
 
 ### Bug #5 — Last playlist song missing
 
 **Reproduced it:** same pytest run, `tests/test_playlists.py`. `test_playlist_returns_all_songs` expected 5 songs back from a 5-song playlist, got 4. `test_playlist_returns_songs_in_order` expected `["Track 1", ... "Track 5"]`, got the same list minus "Track 5".
 
-**Root cause:** `get_playlist_songs()` in `playlist_service.py` builds the correctly ordered song list, then returns `songs[:-1]` — slicing off the last entry regardless of playlist length.
+**How I found the root cause:** followed the two failing tests into `get_playlist_songs()` in `playlist_service.py`. The function builds the ordered list correctly through a loop over `playlist_entries`, then the return statement slices it. One line accounted for both symptoms — the wrong count and the missing final title.
 
-**Fix:** [describe your one-line change and commit hash once made]
+**Root cause:** `get_playlist_songs()` returns `songs[:-1]` instead of `songs`, dropping the last song regardless of playlist length.
 
-**Verification:** [pytest output after fix]
+**Fix:** changed the return to `songs`. Commit `f97142a`. Before committing, grepped for other callers to check for hidden dependencies on the truncated list — found one real caller (`routes/playlists.py`) and one dead import in `notification_service.py` that's never invoked in the function it's imported into, so nothing else relied on the old behavior.
+
+**Verification:** all three playlist tests pass, including `test_empty_playlist_returns_empty_list`, confirming the fix doesn't break the zero-song case.
 
 ### Bug #4 — Rating doesn't notify the sharer
 
@@ -73,13 +77,15 @@ after: 1
 
 The one existing notification was the seeded `song_added_to_playlist` entry, unrelated to this call. Rating produced no new notification.
 
-I originally planned to reproduce the working path (`add_to_playlist`) live through the HTTP route as a contrast, but that call 500s — see the bonus bug below. Instead I confirmed the contrast by reading `add_to_playlist()` in the same file: it calls `create_notification()` after a successful add. `rate_song()` has no equivalent call anywhere in its body.
+**How I found the root cause:** I planned to reproduce the working path (`add_to_playlist`) live through the HTTP route as a contrast, but that call throws a 500 (see the bug noted below). Instead I read `add_to_playlist()` and `rate_song()` side by side in `notification_service.py`. `add_to_playlist()` calls `create_notification()` right after committing the playlist change, gated on `song.shared_by != added_by_user_id`. `rate_song()` saves the `Rating` row, commits, and returns — no equivalent call anywhere in it.
 
-**Root cause:** architectural, not a typo. `notification_service.py` establishes a pattern — perform the action, then call `create_notification()` if the actor isn't the song's original sharer. `add_to_playlist()` follows that pattern. `rate_song()` was written without it; the notification call was simply never added.
+**Root cause:** architectural, not a typo. `notification_service.py` has an established pattern — perform the action, then call `create_notification()` if the actor isn't the song's original sharer. `add_to_playlist()` follows it. `rate_song()` was written without it; the notification call was never added.
 
-**Fix:** [describe your change and commit hash once made]
+**Fix:** added a `create_notification()` call at the end of `rate_song()`, gated on `song.shared_by != user_id`, matching `add_to_playlist()`'s pattern. Commit `3bb2a92`.
 
-**Verification:** [before/after notification count after fix]
+One decision worth flagging: I re-rated the same song with a different score and confirmed the current fix sends a notification on every call, not just the first rating. I left it this way since the issue only asks that rating notify the sharer at all, and a changed score seems worth a second notification. If "notify once per song" is the intended behavior instead, the fix needs an added `not existing` check before the notification call, using the `existing` lookup already present earlier in the function.
+
+**Verification:** first rating — before: 1, after: 2. Second rating, same song, different score — before: 2, after: 3. Full suite (13/13) still passes after all three fixes combined.
 
 ## Bug Found Outside the Assigned Five
 
